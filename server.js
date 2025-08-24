@@ -3,7 +3,7 @@
 const express = require('express');
 const http = require('http');
 const { MongoClient } = require('mongodb');
-const { Server } = require("socket.io");
+const { WebSocketServer } = require('ws'); // Using 'ws' library instead of 'socket.io'
 const cors = require('cors');
 
 const app = express();
@@ -11,15 +11,11 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*", // Allow all origins for simplicity. For production, restrict this to your dashboard's domain.
-        methods: ["GET", "POST"]
-    }
-});
+
+// --- WebSocket Server Setup ---
+const wss = new WebSocketServer({ server });
 
 // --- MongoDB Connection ---
-// Updated with your MongoDB Atlas connection string
 const MONGO_URI = "mongodb+srv://atifsupermart202199:FGzi4j6kRnYTIyP9@cluster0.bfulggv.mongodb.net/?retryWrites=true&w=majority";
 const client = new MongoClient(MONGO_URI);
 let db;
@@ -27,105 +23,104 @@ let db;
 async function connectDB() {
     try {
         await client.connect();
-        db = client.db("nfc_attendance"); // Specify your database name here
+        db = client.db("nfc_attendance");
         console.log('MongoDB Connected...');
     } catch (err) {
         console.error('MongoDB Connection Error:', err);
-        process.exit(1); // Exit process with failure
+        process.exit(1);
     }
 }
 connectDB();
 
-
-// --- API Endpoints ---
-
-// Endpoint for normal scans
+// --- API Endpoints (remain the same) ---
 app.post('/api/nfc', async (req, res) => {
     try {
-        const scansCollection = db.collection('scans'); // Get the 'scans' collection
+        const scansCollection = db.collection('scans');
         const scanData = { ...req.body, timestamp: new Date() };
         await scansCollection.insertOne(scanData);
         console.log('New scan received:', scanData);
         
         // Broadcast the new scan data to all connected dashboards
-        io.emit('new_scan_data', scanData);
+        broadcast({ type: 'new_scan_data', payload: scanData });
 
-        // Example verification logic
-        res.json({
-            name: "MD SARWAR JAHAN",
-            designation: "Developer",
-            verify: "OK"
-        });
+        res.json({ name: "MD SARWAR JAHAN", designation: "Developer", verify: "OK" });
     } catch (error) {
-        console.error("Error saving scan:", error);
         res.status(500).json({ verify: "FAIL", error: "Server error" });
     }
 });
 
-// Endpoint for backup data updates
 app.post('/api/nfcupdat', async (req, res) => {
     try {
         const scansCollection = db.collection('scans');
         const scanData = { ...req.body, timestamp: new Date() };
         await scansCollection.insertOne(scanData);
         console.log('Backup scan received:', scanData);
-        io.emit('new_scan_data', scanData);
-        res.json({
-            name: "Backup User",
-            designation: "Synced",
-            verify: "OK"
-        });
+        broadcast({ type: 'new_scan_data', payload: scanData });
+        res.json({ name: "Backup User", designation: "Synced", verify: "OK" });
     } catch (error) {
-        console.error("Error saving backup scan:", error);
         res.status(500).json({ verify: "FAIL", error: "Server error" });
     }
 });
 
-// Endpoint for status check
 app.get('/api/stts', (req, res) => {
     res.json({ status: 'active' });
 });
 
-
-// --- Socket.IO for Real-time Communication ---
-
+// --- WebSocket Logic ---
 let esp32Socket = null;
 
-io.on('connection', (socket) => {
-    console.log('A user connected:', socket.id);
+wss.on('connection', (ws) => {
+    console.log('A client connected.');
 
-    // Check if the connection is from our ESP32
-    socket.on('esp32_connect', (deviceId) => {
-        console.log(`ESP32 device connected: ${deviceId}`);
-        esp32Socket = socket;
-        // Notify dashboard that device is online
-        io.emit('device_status', { status: 'online', deviceId: deviceId });
-    });
-    
-    // Listen for commands from the dashboard and forward to ESP32
-    const commands = ['unlock', 'restart', 'toggle-backup', 'toggle-unlock', 'toggle-emergency', 'update-all', 'check-status'];
-    commands.forEach(command => {
-        socket.on(command, () => {
-            if (esp32Socket) {
-                console.log(`Forwarding command '${command}' to ESP32`);
-                esp32Socket.emit(command);
-            } else {
-                console.log(`Command '${command}' received, but ESP32 is not connected.`);
-            }
-        });
-    });
-
-    socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-        if (esp32Socket && esp32Socket.id === socket.id) {
-            console.log('ESP32 device disconnected.');
-            esp32Socket = null;
-            // Notify dashboard that device is offline
-            io.emit('device_status', { status: 'offline' });
+    ws.on('message', (message) => {
+        let data;
+        try {
+            data = JSON.parse(message);
+        } catch (e) {
+            console.log('Received non-JSON message:', message.toString());
+            return;
         }
+
+        // Check if it's the ESP32 identifying itself
+        if (data.type === 'esp32_connect') {
+            console.log(`ESP32 device connected: ${data.deviceId}`);
+            esp32Socket = ws;
+            ws.isEsp32 = true; // Mark this connection as the ESP32
+            broadcast({ type: 'device_status', payload: { status: 'online', deviceId: data.deviceId } });
+        }
+        // Handle commands from the dashboard
+        else if (data.type === 'command') {
+            if (esp32Socket && esp32Socket.readyState === ws.OPEN) {
+                console.log(`Forwarding command '${data.command}' to ESP32`);
+                esp32Socket.send(JSON.stringify({ command: data.command }));
+            } else {
+                console.log(`Command '${data.command}' received, but ESP32 is not connected.`);
+            }
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('Client disconnected.');
+        if (ws.isEsp32) {
+            esp32Socket = null;
+            console.log('ESP32 device disconnected.');
+            broadcast({ type: 'device_status', payload: { status: 'offline' } });
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
     });
 });
 
+// Function to broadcast messages to all non-ESP32 clients (dashboards)
+function broadcast(data) {
+    wss.clients.forEach((client) => {
+        if (client !== esp32Socket && client.readyState === client.OPEN) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
 
 // --- Start Server ---
 const PORT = process.env.PORT || 3000;
@@ -140,7 +135,7 @@ server.listen(PORT, () => {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "mongodb": "^6.7.0",
-    "socket.io": "^4.7.5"
+    "ws": "^8.17.0" 
   }
 }
 */
